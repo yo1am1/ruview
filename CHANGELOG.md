@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **Alert core: arm state, confirmed alerts and event history.** New
+  `alert_core` module in the sensing server, stepped once a second from the
+  ADR-424 fused zones. `POST /api/v1/alerts/mode` sets `disarmed`, `armed_home`
+  or `armed_away`; `GET /api/v1/alerts` lists open and closed alerts;
+  `POST /api/v1/alerts/:id/ack` acknowledges one; `GET /api/v1/alerts/events`
+  pages the history. Three rules, each needing a confirming condition:
+  intrusion (armed-away, exit delay over, presence held 10 s), possible fall
+  (a `fall` reading followed by 30 s of presence with low `motion`) and sensor
+  offline (a covered zone with no live source for 60 s, never read as empty).
+  Alerts carry the evidence grade of their readings.
+  `RUVIEW_ALERT_IGNORE_INTRUSION_ZONES` excludes zones from intrusion. CSI
+  nodes now report a coarse `motion` value; the firmware fall flag is not
+  wired in. History is in memory only and no notification is sent. Thresholds
+  are defaults, not measured; tests use SYNTHETIC readings; no false-alarm or
+  detection-rate claim.
 - **Any-source sensor fusion: per-zone presence from CSI plus any sensor (ADR-424).**
   `POST /api/v1/sources/readings` accepts JSON-line readings from any sensor or
   time series; `GET /api/v1/zones` returns one fused presence probability per
