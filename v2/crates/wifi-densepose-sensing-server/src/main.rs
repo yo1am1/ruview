@@ -10,6 +10,7 @@
 #![allow(dead_code)]
 
 mod adaptive_classifier;
+mod alert_core;
 pub mod cli;
 pub mod csi;
 mod engine_bridge;
@@ -1992,6 +1993,8 @@ struct AppStateInner {
     latest_update: Option<SensingUpdate>,
     /// ADR-424: latest reading per source and the node-to-zone map.
     source_fusion: source_fusion::FusionState,
+    /// Arm state, confirmed alerts and event history, stepped once a second.
+    alerts: alert_core::AlertCore,
     rssi_history: VecDeque<f64>,
     /// Circular buffer of recent CSI amplitude vectors for temporal analysis.
     /// Each entry is the full subcarrier amplitude vector for one frame.
@@ -2494,6 +2497,96 @@ mod adr424_zone_fusion_http_tests {
         let (_, body) = call(&app, get_req("/api/v1/pose/zones/summary")).await;
         assert_eq!(body["configured"], false);
         assert!(body["zones"].as_array().unwrap().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod alert_core_http_tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    fn app() -> (Router, SharedState) {
+        let state: SharedState = Arc::new(RwLock::new(AppStateInner::minimal()));
+        let router = Router::new()
+            .route("/api/v1/sources/readings", post(ingest_source_readings))
+            .route("/api/v1/alerts", get(alerts_status))
+            .route("/api/v1/alerts/events", get(alerts_events))
+            .route("/api/v1/alerts/mode", post(alerts_set_mode))
+            .route("/api/v1/alerts/:id/ack", post(alerts_acknowledge))
+            .with_state(state.clone());
+        (router, state)
+    }
+
+    async fn call(app: &Router, method: &str, uri: &str, body: &str) -> (StatusCode, serde_json::Value) {
+        let req = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let response = app.clone().oneshot(req).await.unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null))
+    }
+
+    fn radar(now_ms: i64, values: &str) -> String {
+        format!(
+            r#"{{"timestamp_ms":{now_ms},"source":"radar-bath","kind":"mmwave_radar","room":"flat","zone":"bath","values":{values},"synthetic":true}}"#
+        )
+    }
+
+    #[tokio::test]
+    async fn mode_change_is_reported_and_logged_and_bad_modes_are_refused() {
+        let (app, _) = app();
+        let (status, body) = call(&app, "POST", "/api/v1/alerts/mode", r#"{"mode":"armed_away"}"#).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["mode"], "armed_away");
+        let (status, _) = call(&app, "POST", "/api/v1/alerts/mode", r#"{"mode":"panic"}"#).await;
+        assert!(status.is_client_error());
+        let (_, events) = call(&app, "GET", "/api/v1/alerts/events", "").await;
+        assert_eq!(events["events"].as_array().unwrap().len(), 1);
+        assert_eq!(events["events"][0]["kind"], "mode_changed");
+    }
+
+    #[tokio::test]
+    async fn posted_readings_drive_a_fall_alert_that_can_be_acknowledged_once() {
+        let (app, state) = app();
+        let t0 = chrono::Utc::now().timestamp_millis() - 40_000;
+        // A fall candidate, then 31 s of stillness, one reading and one tick a second.
+        for sec in 0..=31_i64 {
+            let now = t0 + sec * 1000;
+            let values = if sec == 0 {
+                r#"{"presence":1,"motion":0.9,"fall":1}"#
+            } else {
+                r#"{"presence":1,"motion":0.01}"#
+            };
+            let (status, report) = call(&app, "POST", "/api/v1/sources/readings", &radar(now, values)).await;
+            assert_eq!((status, report["accepted"].as_u64()), (StatusCode::OK, Some(1)));
+            alert_step(&mut *state.write().await, now);
+        }
+        let (_, body) = call(&app, "GET", "/api/v1/alerts", "").await;
+        let open = body["open"].as_array().unwrap();
+        assert_eq!(open.len(), 1, "{body}");
+        assert_eq!(open[0]["kind"], "possible_fall");
+        assert_eq!(open[0]["zone"], "bath");
+        assert_eq!(open[0]["evidence"], "SYNTHETIC");
+        let id = open[0]["id"].as_u64().unwrap();
+
+        let (status, body) = call(&app, "POST", &format!("/api/v1/alerts/{id}/ack"), "").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body["open"].as_array().unwrap().is_empty());
+        let (status, _) = call(&app, "POST", &format!("/api/v1/alerts/{id}/ack"), "").await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        let (status, _) = call(&app, "POST", "/api/v1/alerts/999/ack", "").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let (_, events) = call(&app, "GET", "/api/v1/alerts/events?after=1", "").await;
+        let kinds: Vec<&str> =
+            events["events"].as_array().unwrap().iter().map(|e| e["kind"].as_str().unwrap()).collect();
+        assert_eq!(kinds, ["alert_raised", "alert_acknowledged"]);
     }
 }
 
@@ -3162,6 +3255,7 @@ impl AppStateInner {
         AppStateInner {
             latest_update: None,
             source_fusion: source_fusion::FusionState::default(),
+            alerts: alert_core::AlertCore::default(),
             rssi_history: VecDeque::new(),
             frame_history: VecDeque::new(),
             tick: 0,
@@ -8076,6 +8170,91 @@ async fn ingest_source_readings(
     match s.source_fusion.ingest_lines(text, now_ms) {
         Ok(report) => (StatusCode::OK, Json(serde_json::json!(report))),
         Err(e) => (StatusCode::PAYLOAD_TOO_LARGE, Json(serde_json::json!({"error": e}))),
+    }
+}
+
+/// Environment variable listing zones where presence is never an intrusion,
+/// comma-separated (for example a room a pet is kept in).
+const ALERT_IGNORE_ZONES_ENV: &str = "RUVIEW_ALERT_IGNORE_INTRUSION_ZONES";
+
+fn alert_config_from_env() -> alert_core::AlertConfig {
+    let mut config = alert_core::AlertConfig::default();
+    if let Ok(spec) = std::env::var(ALERT_IGNORE_ZONES_ENV) {
+        config.ignore_intrusion_zones =
+            spec.split(',').map(str::trim).filter(|z| !z.is_empty()).map(str::to_string).collect();
+    }
+    config
+}
+
+/// Refresh the CSI nodes' readings and advance the alert rules by one tick.
+fn alert_step(s: &mut AppStateInner, now_ms: i64) {
+    let source = s.effective_source();
+    let update = s.latest_update.clone();
+    s.source_fusion.refresh_csi(update.as_ref(), &source);
+    let signals = s.source_fusion.zone_signals(now_ms);
+    s.alerts.step(now_ms, &signals);
+}
+
+/// Steps the alert rules once a second, whether or not anyone is polling.
+async fn alert_tick_task(state: SharedState) {
+    let mut tick = tokio::time::interval(Duration::from_secs(1));
+    loop {
+        tick.tick().await;
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        alert_step(&mut *state.write().await, now_ms);
+    }
+}
+
+async fn alerts_status(State(state): State<SharedState>) -> Json<serde_json::Value> {
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    Json(state.read().await.alerts.status_json(now_ms))
+}
+
+#[derive(Deserialize)]
+struct AlertEventsQuery {
+    #[serde(default)]
+    after: u64,
+}
+
+/// History events with an id above `after`, oldest first.
+async fn alerts_events(
+    State(state): State<SharedState>,
+    Query(q): Query<AlertEventsQuery>,
+) -> Json<serde_json::Value> {
+    let s = state.read().await;
+    let events: Vec<&alert_core::Event> = s.alerts.events_after(q.after).collect();
+    Json(serde_json::json!({ "events": events }))
+}
+
+#[derive(Deserialize)]
+struct AlertModeBody {
+    mode: alert_core::ArmMode,
+}
+
+async fn alerts_set_mode(
+    State(state): State<SharedState>,
+    Json(body): Json<AlertModeBody>,
+) -> Json<serde_json::Value> {
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let mut s = state.write().await;
+    s.alerts.set_mode(body.mode, now_ms);
+    Json(s.alerts.status_json(now_ms))
+}
+
+async fn alerts_acknowledge(
+    State(state): State<SharedState>,
+    Path(id): Path<u64>,
+) -> impl IntoResponse {
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let mut s = state.write().await;
+    match s.alerts.acknowledge(id, now_ms) {
+        Ok(()) => (StatusCode::OK, Json(s.alerts.status_json(now_ms))),
+        Err(e @ alert_core::AckError::NotFound) => {
+            (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": e.to_string() })))
+        }
+        Err(e @ alert_core::AckError::AlreadyClosed) => {
+            (StatusCode::CONFLICT, Json(serde_json::json!({ "error": e.to_string() })))
+        }
     }
 }
 
@@ -14862,6 +15041,7 @@ async fn main() {
     let state: SharedState = Arc::new(RwLock::new(AppStateInner {
         latest_update: None,
         source_fusion: source_fusion::FusionState::from_env(),
+        alerts: alert_core::AlertCore::new(alert_config_from_env()),
         rssi_history: VecDeque::new(),
         frame_history: VecDeque::new(),
         tick: 0,
@@ -15124,6 +15304,7 @@ async fn main() {
         tokio::spawn(broadcast_tick_task(state.clone(), args.tick_ms));
         tokio::spawn(node_states_eviction_task(state.clone()));
     }
+    tokio::spawn(alert_tick_task(state.clone()));
     if plan.run_wifi {
         tokio::spawn(wifi_task(state.clone(), args.tick_ms));
     }
@@ -15359,6 +15540,11 @@ async fn main() {
         // ADR-424: any-source readings in, fused per-zone presence out.
         .route("/api/v1/zones", get(zones_endpoint))
         .route("/api/v1/sources/readings", post(ingest_source_readings))
+        // Alert core: arm state, confirmed alerts, event history.
+        .route("/api/v1/alerts", get(alerts_status))
+        .route("/api/v1/alerts/events", get(alerts_events))
+        .route("/api/v1/alerts/mode", post(alerts_set_mode))
+        .route("/api/v1/alerts/:id/ack", post(alerts_acknowledge))
         .route("/api/v1/pose/activities", get(pose_activities))
         // Dashboard-compatible aliases for the field-model calibration API.
         .route("/api/v1/pose/calibrate", post(calibration_start))

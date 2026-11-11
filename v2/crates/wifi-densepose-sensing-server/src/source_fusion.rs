@@ -353,6 +353,57 @@ impl SourceFusion {
     }
 }
 
+/// Value name carrying motion in `[0, 1]`, read from any kind of source.
+pub const MOTION_VALUE: &str = "motion";
+/// Value name carrying a fall-candidate flag (1 = candidate).
+pub const FALL_VALUE: &str = "fall";
+
+impl SourceFusion {
+    /// Per-zone input for the alert core: fused presence plus the motion and
+    /// fall-candidate values of the zone's fresh, healthy readings. Evidence is
+    /// the weakest grade among the zone's fused presence and those readings.
+    pub fn zone_signals(&self, now_ms: i64) -> Vec<crate::alert_core::ZoneSignal> {
+        self.zones(now_ms)
+            .into_iter()
+            .map(|z| {
+                let (mut motion, mut fall) = (None::<f64>, false);
+                let (mut synthetic, mut unverified) = (false, false);
+                for r in self.latest.values() {
+                    let fresh = (now_ms - r.timestamp_ms).max(0) <= STALE_AFTER_MS
+                        && r.health == Health::Ok;
+                    if !fresh || r.zone.as_deref() != Some(&z.zone) || r.room != z.room {
+                        continue;
+                    }
+                    let m = r.values.get(MOTION_VALUE).copied().filter(|m| (0.0..=1.0).contains(m));
+                    let f = r.values.get(FALL_VALUE) == Some(&1.0);
+                    if m.is_some() || f {
+                        synthetic |= r.synthetic;
+                        unverified |= !r.verified;
+                    }
+                    if let Some(m) = m {
+                        motion = Some(motion.map_or(m, |prev| prev.max(m)));
+                    }
+                    fall |= f;
+                }
+                let evidence = match (z.evidence, synthetic, unverified) {
+                    ("NONE", _, _) => "NONE",
+                    (_, true, _) | ("SYNTHETIC", _, _) => "SYNTHETIC",
+                    (_, _, true) | ("CLAIMED", _, _) => "CLAIMED",
+                    _ => "MEASURED",
+                };
+                crate::alert_core::ZoneSignal {
+                    room: z.room,
+                    zone: z.zone,
+                    presence_probability: z.presence_probability,
+                    motion,
+                    fall,
+                    evidence,
+                }
+            })
+            .collect()
+    }
+}
+
 /// Most lines accepted in one ingest request.
 pub const MAX_LINES_PER_REQUEST: usize = 256;
 /// Environment variable mapping CSI node ids to zones:
@@ -458,6 +509,9 @@ impl FusionState {
             let conf = nf.classification.confidence;
             let mut values = BTreeMap::new();
             values.insert("presence".to_string(), if nf.classification.presence { 1.0 } else { 0.0 });
+            // Coarse motion for the alert core: the classifier only says moving or not.
+            let moving = nf.classification.motion_level == "present_moving";
+            values.insert(MOTION_VALUE.to_string(), if moving { 1.0 } else { 0.0 });
             self.fusion.ingest(SourceReading {
                 timestamp_ms,
                 source: format!("csi-node-{}", nf.node_id),
@@ -475,6 +529,11 @@ impl FusionState {
 
     pub fn zones(&self, now_ms: i64) -> Vec<ZonePresence> {
         self.fusion.zones(now_ms)
+    }
+
+    /// One alert-core signal per fused zone.
+    pub fn zone_signals(&self, now_ms: i64) -> Vec<crate::alert_core::ZoneSignal> {
+        self.fusion.zone_signals(now_ms)
     }
 
     /// Response body of `GET /api/v1/zones`.
@@ -496,6 +555,39 @@ mod tests {
     use super::*;
 
     const NOW: i64 = 1_794_250_000_000;
+
+    #[test]
+    fn zone_signals_carry_motion_fall_and_the_weakest_evidence() {
+        let mut f = SourceFusion::new(builtin_descriptors());
+        let radar = format!(
+            r#"{{"timestamp_ms":{NOW},"source":"radar-1","kind":"mmwave_radar","room":"flat","zone":"bath","values":{{"presence":1,"motion":0.2,"fall":1}}}}"#
+        );
+        f.ingest_line(&radar, NOW).unwrap();
+        // A context-only kind in the same zone still contributes motion.
+        let mat = format!(
+            r#"{{"timestamp_ms":{NOW},"source":"mat-1","kind":"pressure_mat","room":"flat","zone":"bath","values":{{"motion":0.6}},"synthetic":true}}"#
+        );
+        f.ingest_line(&mat, NOW).unwrap();
+        // Out-of-range motion and another zone's fall are ignored.
+        let other = format!(
+            r#"{{"timestamp_ms":{NOW},"source":"radar-2","kind":"mmwave_radar","room":"flat","zone":"hall","values":{{"presence":0,"motion":7}}}}"#
+        );
+        f.ingest_line(&other, NOW).unwrap();
+
+        let signals = f.zone_signals(NOW);
+        let bath = signals.iter().find(|s| s.zone == "bath").unwrap();
+        assert_eq!(bath.motion, Some(0.6));
+        assert!(bath.fall);
+        assert_eq!(bath.evidence, "SYNTHETIC", "one synthetic reading grades the signal");
+        let hall = signals.iter().find(|s| s.zone == "hall").unwrap();
+        assert_eq!((hall.motion, hall.fall, hall.evidence), (None, false, "CLAIMED"));
+
+        // Stale readings stop carrying motion and fall, and presence goes unknown.
+        let later = f.zone_signals(NOW + STALE_AFTER_MS + 1);
+        let bath = later.iter().find(|s| s.zone == "bath").unwrap();
+        assert_eq!((bath.presence_probability, bath.motion, bath.fall), (None, None, false));
+        assert_eq!(bath.evidence, "NONE");
+    }
 
     fn line(source: &str, kind: &str, zone: &str, values: &str, extra: &str) -> String {
         format!(
